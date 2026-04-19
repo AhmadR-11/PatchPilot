@@ -2,45 +2,107 @@
 
 # agent.py
 import os
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_cohere import ChatCohere
 from langgraph.prebuilt import create_react_agent
-from github_tools import get_github_file, create_pull_request
+from github_tools import list_repo_files, get_github_file, create_pull_request, update_fix_branch
 from dotenv import load_dotenv
+from ws_manager import manager
 
 load_dotenv()
 
-# 1. Define the LLM (Gemini)
-#    langchain-google-genai reads the GOOGLE_API_KEY environment variable automatically.
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+# Using Cohere API for excellent tool calling performance
+llm = ChatCohere(
+    model="command-r-plus-08-2024", 
+    cohere_api_key=os.getenv("COHERE_API_KEY"),
+    temperature=0
+)
 
-# 2. Define the tools
-tools = [get_github_file, create_pull_request]
+tools = [list_repo_files, get_github_file, create_pull_request, update_fix_branch]
 
-# 3. System prompt — passed directly as a string to create_react_agent
+# LangGraph's create_react_agent handles binding automatically
+
 system_prompt = """You are PatchPilot, an elite DevOps AI Agent.
-Your job is to analyze failed CI/CD pipeline logs, find the bug in the code, and submit a fix.
+Your job is to analyze real CI/CD failure logs, find the exact bug, and submit the correct fix.
 
-Follow these exact steps:
-1. Read the error logs provided by the user.
-2. Identify which file is causing the error. (e.g., a syntax error in a .js file or a bad PATH variable in a config).
-3. Use the 'get_github_file' tool to read the contents of the broken file.
-4. Figure out how to fix the code.
-5. Use the 'create_pull_request' tool to submit the fixed code.
+⚠️ FOLLOW THESE STEPS EXACTLY:
 
-Only reply with the final result or the PR link once you are finished."""
+STEP 1 — ANALYZE THE LOGS:
+  Read the error logs. Identify:
+  - Which file is broken
+  - What the expected vs actual value is
+  - The exact line if mentioned
 
-# 4. Construct the Agent using LangGraph (replaces the old create_tool_calling_agent + AgentExecutor)
-#    create_react_agent is the modern API in LangChain 1.x / LangGraph 1.x
+STEP 2 — EXPLORE THE REPOSITORY:
+  Use 'list_repo_files' to find the exact file path.
+
+STEP 3 — READ THE CURRENT FILE:
+  Use 'get_github_file' to read the COMPLETE file content.
+  If a fix branch is specified in your instructions, pass it as branch_ref to see the current state.
+
+STEP 4 — REASON ABOUT THE FIX:
+  Think carefully:
+  - What does the test/build EXPECT?
+  - What is the MINIMAL change to make it pass?
+  - Fix the CODE — do NOT change the test expectations.
+
+STEP 5 — SUBMIT:
+  Read your instructions carefully:
+
+  A) If instructions say "FIRST ATTEMPT" → use 'create_pull_request':
+     - original_snippet: exact broken lines (verbatim from the file)
+     - fixed_snippet: the corrected lines only
+     - branch_name: use the branch name given in your instructions
+
+  B) If instructions say "RETRY ATTEMPT" → use 'update_fix_branch':
+     - Read the file using get_github_file with branch_ref set to the fix branch
+     - original_snippet: exact lines from the current state of the fix branch
+     - fixed_snippet: your new corrected version
+     - branch_name: the existing fix branch from your instructions
+
+  ✅ DO: Provide only the specific lines to change (surgical patch).
+  ❌ DON'T: Write the entire file — this causes code loss.
+
+Report the final PR link or update confirmation when done."""
+
 agent = create_react_agent(llm, tools, prompt=system_prompt)
 
-def run_patchpilot(repo_name: str, error_logs: str):
-    """Entry point for the FastAPI server to trigger the agent."""
-    print(f"\n🚀 PatchPilot activated for repository: {repo_name}...")
-    
-    user_input = f"Repository: {repo_name}\n\nPipeline Error Logs:\n{error_logs}\n\nPlease fix this."
-    
-    # Execute the agent — LangGraph uses a messages-based interface
+
+def run_patchpilot(repo_name: str, error_logs: str, fix_branch: str, attempt: int):
+    """Entry point called by the FastAPI background task."""
+    is_retry = attempt > 1
+    mode = f"RETRY ATTEMPT #{attempt}" if is_retry else "FIRST ATTEMPT"
+
+    manager.sync_broadcast({"type": "status", "data": "Investigating"})
+    manager.sync_broadcast({"type": "log", "data": f"> 🚀 PatchPilot [{mode}] for repository: {repo_name}..."})
+    manager.sync_broadcast({"type": "log", "data": f"> 🌿 Fix branch: {fix_branch}"})
+    print(f"\n🚀 PatchPilot [{mode}] for repository: {repo_name}...")
+    print(f"🌿 Fix branch: {fix_branch}\n")
+
+    if is_retry:
+        fix_instruction = (
+            f"\n\n⚠️  {mode}: A previous fix was pushed to branch '{fix_branch}' but CI still failed.\n"
+            f"Do NOT call 'create_pull_request'. Instead:\n"
+            f"1. Use 'get_github_file' with branch_ref='{fix_branch}' to see the current broken state.\n"
+            f"2. Analyze what went wrong with the previous fix.\n"
+            f"3. Use 'update_fix_branch' with branch_name='{fix_branch}' to push a new corrected fix."
+        )
+    else:
+        fix_instruction = (
+            f"\n\n✅ {mode}: Use 'create_pull_request' with branch_name='{fix_branch}'."
+        )
+
+    user_input = (
+        f"Repository: {repo_name}\n\n"
+        f"CI/CD Failure Logs:\n"
+        f"{'-' * 50}\n"
+        f"{error_logs}\n"
+        f"{'-' * 50}"
+        f"{fix_instruction}"
+    )
+
     response = agent.invoke({"messages": [("human", user_input)]})
-    
-    # The final AI message is the last item in the messages list
-    return response["messages"][-1].content
+    final_output = response["messages"][-1].content
+    manager.sync_broadcast({"type": "log", "data": f"> ✅ PatchPilot [{mode}] finished."})
+    manager.sync_broadcast({"type": "status", "data": "Awaiting Approval"})
+    print(f"\n✅ PatchPilot [{mode}] finished:\n{final_output}")
+    return final_output

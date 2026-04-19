@@ -6,63 +6,163 @@ from github import Github
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 import uuid
+from ws_manager import manager
 
 load_dotenv()
 
-# Initialize GitHub client
 gh_token = os.getenv("GITHUB_TOKEN")
 gh_client = Github(gh_token)
 
+
 @tool
-def get_github_file(repo_name: str, file_path: str) -> str:
+def list_repo_files(repo_name: str, directory: str = "") -> str:
     """
-    Fetches the content of a specific file from a GitHub repository.
-    Use this tool to read the code that might be causing the pipeline error.
+    Lists all files in a GitHub repository RECURSIVELY.
+    Use this FIRST to see the full repository structure and find the exact file path.
+    You do NOT need to guess paths or call this multiple times.
     """
+    manager.sync_broadcast({"type": "log", "data": "> 🔍 Exploring repository structure..."})
     try:
         repo = gh_client.get_repo(repo_name)
-        file_content = repo.get_contents(file_path)
+        default_branch = repo.default_branch
+        branch = repo.get_branch(default_branch)
+        tree = repo.get_git_tree(branch.commit.sha, recursive=True)
+        
+        file_list = []
+        for item in tree.tree:
+            if item.type == "blob":
+                # Filter out obvious noisy directories to save tokens
+                if not any(noise in item.path for noise in [".git/", "node_modules/", "venv/", "__pycache__/"]):
+                    file_list.append(f"📄 {item.path}")
+        return "\n".join(file_list)
+    except Exception as e:
+        return f"Error listing files: {str(e)}"
+
+
+@tool
+def get_github_file(repo_name: str, file_path: str, branch_ref: str = "") -> str:
+    """
+    Fetches the COMPLETE content of a file from a GitHub repository.
+    - branch_ref: optional branch name to read from (e.g., "patchpilot-fix-abc123").
+                  Leave empty to read from the default branch (main/master).
+    Always read the full file before deciding on a fix.
+    """
+    manager.sync_broadcast({"type": "log", "data": f"> 📄 Reading file content: {file_path}"})
+    try:
+        repo = gh_client.get_repo(repo_name)
+        kwargs = {"ref": branch_ref} if branch_ref else {}
+        file_content = repo.get_contents(file_path, **kwargs)
         return file_content.decoded_content.decode("utf-8")
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
+
 @tool
-def create_pull_request(repo_name: str, file_path: str, new_code: str, commit_message: str) -> str:
+def create_pull_request(
+    repo_name: str,
+    file_path: str,
+    original_snippet: str,
+    fixed_snippet: str,
+    commit_message: str,
+    branch_name: str = ""
+) -> str:
     """
-    Creates a new branch, updates the broken file with the new code, and opens a Pull Request.
-    Call this tool ONLY after you have completely figured out the fix.
+    Applies a surgical fix to a file and opens a Pull Request.
+    This tool:
+      1. Reads the full file from GitHub.
+      2. Finds 'original_snippet' and replaces it with 'fixed_snippet'.
+      3. Creates a fix branch (uses 'branch_name' if provided, else auto-generates one).
+      4. Pushes the complete patched file.
+      5. Opens a Pull Request.
+
+    Parameters:
+    - original_snippet: EXACT lines to replace (copy verbatim from get_github_file output).
+    - fixed_snippet: The corrected replacement lines only.
+    - branch_name: Optional. If provided by instructions, use that exact name.
+
+    Do NOT provide the entire file — just the snippet to change.
     """
+    manager.sync_broadcast({"type": "log", "data": f"> 🛠️ Applying surgical fix and creating PR for {file_path}..."})
     try:
         repo = gh_client.get_repo(repo_name)
-        
-        # 1. Get the default branch (usually 'main' or 'master')
         default_branch = repo.default_branch
         sb = repo.get_branch(default_branch)
-        
-        # 2. Create a unique branch name for the AI fix
-        new_branch_name = f"patchpilot-fix-{uuid.uuid4().hex[:6]}"
+
+        # Read full file
+        file_obj = repo.get_contents(file_path, ref=default_branch)
+        full_content = file_obj.decoded_content.decode("utf-8")
+
+        if original_snippet not in full_content:
+            return (
+                f"❌ original_snippet not found in '{file_path}'. "
+                "Copy it exactly from get_github_file output (whitespace matters)."
+            )
+
+        patched_content = full_content.replace(original_snippet, fixed_snippet, 1)
+
+        # Use provided branch name or generate a new one
+        new_branch_name = branch_name.strip() if branch_name.strip() else f"patchpilot-fix-{uuid.uuid4().hex[:6]}"
         repo.create_git_ref(ref=f"refs/heads/{new_branch_name}", sha=sb.commit.sha)
-        
-        # 3. Get the specific file we want to update
-        file = repo.get_contents(file_path, ref=default_branch)
-        
-        # 4. Update the file on the new branch
-        repo.update_file(
-            file.path,
-            commit_message,
-            new_code,
-            file.sha,
-            branch=new_branch_name
-        )
-        
-        # 5. Open the Pull Request
+
+        repo.update_file(file_obj.path, commit_message, patched_content, file_obj.sha, branch=new_branch_name)
+
         pr = repo.create_pull(
             title=f"PatchPilot Fix: {commit_message}",
-            body="🤖 This PR was automatically generated by PatchPilot to fix a pipeline failure. Please review the code changes carefully.",
+            body=(
+                "🤖 Auto-generated by PatchPilot.\n\n"
+                f"**File:** `{file_path}`\n**Fix:** {commit_message}"
+            ),
             head=new_branch_name,
             base=default_branch
         )
-        return f"Success! Pull Request created at: {pr.html_url}"
-    
+        manager.sync_broadcast({"type": "pr_link", "data": pr.html_url})
+        return f"✅ PR created on branch '{new_branch_name}': {pr.html_url}"
+
     except Exception as e:
         return f"Error creating Pull Request: {str(e)}"
+
+
+@tool
+def update_fix_branch(
+    repo_name: str,
+    branch_name: str,
+    file_path: str,
+    original_snippet: str,
+    fixed_snippet: str,
+    commit_message: str
+) -> str:
+    """
+    Updates a file on an EXISTING fix branch (used for retry attempts).
+    Use this when a previous fix on this branch failed CI and you need to try a different fix.
+    The existing open PR will automatically reflect the new changes.
+
+    - branch_name: The existing patchpilot-fix-* branch name given in your instructions.
+    - original_snippet: EXACT lines to replace (copy verbatim from get_github_file output
+                        with branch_ref set to branch_name so you see the current state).
+    - fixed_snippet: The corrected replacement.
+    """
+    manager.sync_broadcast({"type": "log", "data": f"> 🛠️ Updating fix branch for {file_path}..."})
+    try:
+        repo = gh_client.get_repo(repo_name)
+
+        # Read the file from the FIX branch (not main) to see the current state
+        file_obj = repo.get_contents(file_path, ref=branch_name)
+        full_content = file_obj.decoded_content.decode("utf-8")
+
+        if original_snippet not in full_content:
+            return (
+                f"❌ original_snippet not found in '{file_path}' on branch '{branch_name}'. "
+                "Use get_github_file with branch_ref='{branch_name}' to read the current state."
+            )
+
+        patched_content = full_content.replace(original_snippet, fixed_snippet, 1)
+
+        repo.update_file(file_obj.path, commit_message, patched_content, file_obj.sha, branch=branch_name)
+
+        return (
+            f"✅ File updated on branch '{branch_name}'. "
+            "The existing PR now reflects your new fix. CI will run again automatically."
+        )
+
+    except Exception as e:
+        return f"Error updating fix branch: {str(e)}"

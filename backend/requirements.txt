@@ -3,8 +3,9 @@
 fastapi
 uvicorn[standard]
 langchain>=0.2.0
-langchain-google-genai
+langchain-cohere
 PyGithub
 python-dotenv
 pydantic
 langchain-core>=0.2.0
+requests
